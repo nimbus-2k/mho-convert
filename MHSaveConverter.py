@@ -62,6 +62,62 @@ def resolve_email_conflict(cursor, account_table, email):
 
         print("Please enter 'o' to overwrite or 'r' to rename.")
 
+def build_overwrite_cleanup_statements(
+    cursor,
+    account_table,
+    player_table,
+    avatar_table,
+    teamup_table,
+    item_table,
+    controlled_entity_table,
+    account_id,
+    email,
+):
+    statements = {
+        "ControlledEntity": [],
+        "Item": [],
+        "TeamUp": [],
+        "Avatar": [],
+        "Player": [],
+        "Account": [],
+    }
+
+    avatar_ids = []
+    teamup_ids = []
+
+    if avatar_table:
+        cursor.execute(f"SELECT DbGuid FROM {avatar_table} WHERE ContainerDbGuid=?", (account_id,))
+        avatar_ids = [row[0] for row in cursor.fetchall()]
+
+    if teamup_table:
+        cursor.execute(f"SELECT DbGuid FROM {teamup_table} WHERE ContainerDbGuid=?", (account_id,))
+        teamup_ids = [row[0] for row in cursor.fetchall()]
+
+    if controlled_entity_table and avatar_ids:
+        placeholders = ", ".join("?" for _ in avatar_ids)
+        statements["ControlledEntity"].append(
+            (f"DELETE FROM {controlled_entity_table} WHERE ContainerDbGuid IN ({placeholders})", tuple(avatar_ids))
+        )
+
+    if item_table:
+        container_ids = [account_id] + avatar_ids + teamup_ids
+        placeholders = ", ".join("?" for _ in container_ids)
+        statements["Item"].append(
+            (f"DELETE FROM {item_table} WHERE ContainerDbGuid IN ({placeholders})", tuple(container_ids))
+        )
+
+    if teamup_table:
+        statements["TeamUp"].append((f"DELETE FROM {teamup_table} WHERE ContainerDbGuid=?", (account_id,)))
+
+    if avatar_table:
+        statements["Avatar"].append((f"DELETE FROM {avatar_table} WHERE ContainerDbGuid=?", (account_id,)))
+
+    if player_table:
+        statements["Player"].append((f"DELETE FROM {player_table} WHERE DbGuid=?", (account_id,)))
+
+    statements["Account"].append((f"DELETE FROM {account_table} WHERE Email=?", (email,)))
+    return statements
+
 def json_to_sql_inserts(json_data, db_path="Account.db"):
     sql_inserts = {}
 
@@ -90,17 +146,31 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
         "Flags": json_data.get("Flags", 0),
     }
 
-    action, resolved_email, _ = resolve_email_conflict(cursor, account_table, user_data["Email"])
+    action, resolved_email, existing_account_id = resolve_email_conflict(cursor, account_table, user_data["Email"])
     user_data["Email"] = resolved_email
 
     if action == "overwrite":
         print(f"Overwriting account '{user_data['Email']}'")
-        sql_inserts["Account"] = [(
-            f"""UPDATE {account_table} SET
-               PlayerName=?, PasswordHash=?, Salt=?, UserLevel=?, Flags=?
-               WHERE Email=?""",
-            (user_data["PlayerName"], user_data["PasswordHash"], user_data["Salt"], user_data["UserLevel"], user_data["Flags"], user_data["Email"])
-        )]
+        sql_inserts.update(
+            build_overwrite_cleanup_statements(
+                cursor,
+                account_table,
+                player_table,
+                avatar_table,
+                teamup_table,
+                item_table,
+                controlled_entity_table,
+                existing_account_id,
+                user_data["Email"],
+            )
+        )
+        sql_inserts["Account"].append(
+            (
+                f"""INSERT INTO {account_table} (Id, Email, PlayerName, PasswordHash, Salt, UserLevel, Flags)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                tuple(user_data.values()),
+            )
+        )
     else:
         if action == "insert" and resolved_email != json_data.get("Email"):
             print(f"Inserting account with renamed email '{resolved_email}'")
@@ -118,29 +188,49 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
     placeholders = ", ".join("?" for _ in player_copy)
     update_clause = ", ".join([f"{col}=excluded.{col}" for col in player_copy if col != "DbGuid"])
 
-    sql_inserts["Player"] = [(
+    player_upsert_statement = (
         f"INSERT INTO {player_table} ({columns}) VALUES ({placeholders}) "
         f"ON CONFLICT(DbGuid) DO UPDATE SET {update_clause};",
         tuple(player_copy.values())
-    )]
+    )
+    if action == "overwrite":
+        sql_inserts["Player"].append(player_upsert_statement)
+    else:
+        sql_inserts["Player"] = [player_upsert_statement]
 
     if avatar_table:
-        sql_inserts["Avatar"] = build_entity_upserts(avatar_table, json_data.get("Avatars", []))
+        avatar_upserts = build_entity_upserts(avatar_table, json_data.get("Avatars", []))
+        if action == "overwrite":
+            sql_inserts["Avatar"].extend(avatar_upserts)
+        else:
+            sql_inserts["Avatar"] = avatar_upserts
     else:
         print("Warning: Avatar table not found; skipping Avatars import.")
 
     if teamup_table:
-        sql_inserts["TeamUp"] = build_entity_upserts(teamup_table, json_data.get("TeamUps", []))
+        teamup_upserts = build_entity_upserts(teamup_table, json_data.get("TeamUps", []))
+        if action == "overwrite":
+            sql_inserts["TeamUp"].extend(teamup_upserts)
+        else:
+            sql_inserts["TeamUp"] = teamup_upserts
     else:
         print("Warning: TeamUp table not found; skipping TeamUps import.")
 
     if item_table:
-        sql_inserts["Item"] = build_entity_upserts(item_table, json_data.get("Items", []))
+        item_upserts = build_entity_upserts(item_table, json_data.get("Items", []))
+        if action == "overwrite":
+            sql_inserts["Item"].extend(item_upserts)
+        else:
+            sql_inserts["Item"] = item_upserts
     else:
         print("Warning: Item table not found; skipping Items import.")
 
     if controlled_entity_table:
-        sql_inserts["ControlledEntity"] = build_entity_upserts(controlled_entity_table, json_data.get("ControlledEntities", []))
+        controlled_entity_upserts = build_entity_upserts(controlled_entity_table, json_data.get("ControlledEntities", []))
+        if action == "overwrite":
+            sql_inserts["ControlledEntity"].extend(controlled_entity_upserts)
+        else:
+            sql_inserts["ControlledEntity"] = controlled_entity_upserts
     else:
         print("Warning: ControlledEntity table not found; skipping ControlledEntities import.")
 
