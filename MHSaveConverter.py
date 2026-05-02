@@ -3,6 +3,7 @@ import json
 import base64
 import sqlite3
 import os
+import random
 
 def safe_b64decode(data):
     if not data:
@@ -61,6 +62,76 @@ def resolve_email_conflict(cursor, account_table, email):
             continue
 
         print("Please enter 'o' to overwrite or 'r' to rename.")
+
+def resolve_playername_conflict(cursor, account_table, player_name):
+    while True:
+        cursor.execute(f"SELECT Id FROM {account_table} WHERE PlayerName = ?", (player_name,))
+        existing = cursor.fetchone()
+        if not existing:
+            return player_name
+
+        response = input(
+            f"PlayerName '{player_name}' already exists (Id={existing[0]}). "
+            "Enter a new name: "
+        ).strip()
+
+        if not response:
+            print("PlayerName cannot be empty.")
+            continue
+
+        player_name = response
+
+
+def id_exists_in_tables(cursor, account_table, guid_tables, candidate_id):
+    cursor.execute(f"SELECT 1 FROM {account_table} WHERE Id=?", (candidate_id,))
+    if cursor.fetchone():
+        return True
+
+    for table in guid_tables:
+        if not table:
+            continue
+        cursor.execute(f"SELECT 1 FROM {table} WHERE DbGuid=?", (candidate_id,))
+        if cursor.fetchone():
+            return True
+    return False
+
+
+def generate_unique_global_id(cursor, account_table, guid_tables):
+    while True:
+        new_id = random.randint(1, 2**63 - 1)
+        if not id_exists_in_tables(cursor, account_table, guid_tables, new_id):
+            return new_id
+
+
+def remap_ids_for_renamed_insert(json_data, new_account_id, cursor, account_table, guid_tables):
+    id_map = {}
+
+    player = json_data.get("Player", {})
+    old_player_id = player.get("DbGuid") if isinstance(player, dict) else None
+    if old_player_id is not None:
+        id_map[old_player_id] = new_account_id
+
+    for collection_name in ("Avatars", "TeamUps", "Items", "ControlledEntities"):
+        for entity in json_data.get(collection_name, []):
+            old_id = entity.get("DbGuid")
+            if old_id is None:
+                continue
+            if old_id not in id_map:
+                id_map[old_id] = generate_unique_global_id(cursor, account_table, guid_tables)
+
+    if isinstance(player, dict):
+        player["DbGuid"] = new_account_id
+
+    for collection_name in ("Avatars", "TeamUps", "Items", "ControlledEntities"):
+        for entity in json_data.get(collection_name, []):
+            old_id = entity.get("DbGuid")
+            if old_id in id_map:
+                entity["DbGuid"] = id_map[old_id]
+
+            container_id = entity.get("ContainerDbGuid")
+            if container_id in id_map:
+                entity["ContainerDbGuid"] = id_map[container_id]
+
 
 def build_overwrite_cleanup_statements(
     cursor,
@@ -129,6 +200,7 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
     teamup_table = get_table_name(cursor, "TeamUp")
     item_table = get_table_name(cursor, "Item")
     controlled_entity_table = get_table_name(cursor, "ControlledEntity")
+    guid_tables = [player_table, avatar_table, teamup_table, item_table, controlled_entity_table]
     if not account_table or not player_table:
         conn.close()
         raise ValueError(
@@ -148,6 +220,8 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
 
     action, resolved_email, existing_account_id = resolve_email_conflict(cursor, account_table, user_data["Email"])
     user_data["Email"] = resolved_email
+
+    user_data["PlayerName"] = resolve_playername_conflict(cursor, account_table, user_data["PlayerName"])
 
     if action == "overwrite":
         print(f"Overwriting account '{user_data['Email']}'")
@@ -174,6 +248,15 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
     else:
         if action == "insert" and resolved_email != json_data.get("Email"):
             print(f"Inserting account with renamed email '{resolved_email}'")
+            user_data["Id"] = generate_unique_global_id(cursor, account_table, guid_tables)
+            json_data["Id"] = user_data["Id"]
+            remap_ids_for_renamed_insert(
+                json_data,
+                user_data["Id"],
+                cursor,
+                account_table,
+                guid_tables,
+            )
         sql_inserts["Account"] = [(
             f"""INSERT INTO {account_table} (Id, Email, PlayerName, PasswordHash, Salt, UserLevel, Flags)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
