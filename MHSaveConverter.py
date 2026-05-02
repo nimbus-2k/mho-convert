@@ -63,11 +63,13 @@ def resolve_email_conflict(cursor, account_table, email):
 
         print("Please enter 'o' to overwrite or 'r' to rename.")
 
-def resolve_playername_conflict(cursor, account_table, player_name):
+def resolve_playername_conflict(cursor, account_table, player_name, ignore_account_id=None):
     while True:
         cursor.execute(f"SELECT Id FROM {account_table} WHERE PlayerName = ?", (player_name,))
         existing = cursor.fetchone()
         if not existing:
+            return player_name
+        if ignore_account_id is not None and existing[0] == ignore_account_id:
             return player_name
 
         response = input(
@@ -221,7 +223,12 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
     action, resolved_email, existing_account_id = resolve_email_conflict(cursor, account_table, user_data["Email"])
     user_data["Email"] = resolved_email
 
-    user_data["PlayerName"] = resolve_playername_conflict(cursor, account_table, user_data["PlayerName"])
+    user_data["PlayerName"] = resolve_playername_conflict(
+        cursor,
+        account_table,
+        user_data["PlayerName"],
+        existing_account_id if action == "overwrite" else None,
+    )
 
     if action == "overwrite":
         print(f"Overwriting account '{user_data['Email']}'")
