@@ -220,6 +220,8 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
         "Flags": json_data.get("Flags", 0),
     }
 
+    user_data = filter_existing_columns(cursor, account_table, user_data)
+
     action, resolved_email, existing_account_id = resolve_email_conflict(cursor, account_table, user_data["Email"])
     user_data["Email"] = resolved_email
 
@@ -229,6 +231,14 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
         user_data["PlayerName"],
         existing_account_id if action == "overwrite" else None,
     )
+
+    columns = ", ".join(user_data.keys())
+    placeholders = ", ".join("?" for _ in user_data)
+
+    query = f"""
+    INSERT INTO {account_table} ({columns})
+    VALUES ({placeholders})
+    """
 
     if action == "overwrite":
         print(f"Overwriting account '{user_data['Email']}'")
@@ -245,13 +255,10 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
                 user_data["Email"],
             )
         )
-        sql_inserts["Account"].append(
-            (
-                f"""INSERT INTO {account_table} (Id, Email, PlayerName, PasswordHash, Salt, UserLevel, Flags)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                tuple(user_data.values()),
-            )
-        )
+        sql_inserts["Account"].append((
+            query,
+            tuple(user_data.values())
+        ))
     else:
         if action == "insert" and resolved_email != json_data.get("Email"):
             print(f"Inserting account with renamed email '{resolved_email}'")
@@ -265,14 +272,15 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
                 guid_tables,
             )
         sql_inserts["Account"] = [(
-            f"""INSERT INTO {account_table} (Id, Email, PlayerName, PasswordHash, Salt, UserLevel, Flags)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            query,
             tuple(user_data.values())
         )]
 
     player = json_data.get("Player", {})
     player_copy = player.copy()
     player_copy["ArchiveData"] = safe_b64decode(player_copy.get("ArchiveData"))
+
+    player_copy = filter_existing_columns(cursor, player_table, player_copy)
 
     columns = ", ".join(player_copy.keys())
     placeholders = ", ".join("?" for _ in player_copy)
@@ -327,36 +335,61 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
     conn.close()
     return sql_inserts
 
+def filter_existing_columns(cursor, table_name, data_dict):
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    valid_columns = {row[1] for row in cursor.fetchall()}
+
+    return {
+        key: value
+        for key, value in data_dict.items()
+        if key in valid_columns
+    }
+
 def load_json_from_file(file_path):
     try:
         with open(file_path, 'r') as f:
             return json.load(f)
     except FileNotFoundError:
         print(f"Error: File not found at {file_path}")
+        input("Press any key to exit...")
     except json.JSONDecodeError as e:
         print(f"Error: Invalid JSON format. {e}")
+        input("Press any key to exit...")
     return None
 
 def insert_into_database(sql_statements, db_path="Account.db"):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+
     for table, statements in sql_statements.items():
         for query, values in statements:
             cursor.execute(query, values)
+
     conn.commit()
     conn.close()
     print(f"Data inserted into {db_path}")
 
 json_file_path = sys.argv[1] if len(sys.argv) > 1 else "tahiti.json"
 db_file_path = sys.argv[2] if len(sys.argv) > 2 else "Account.db"
+
 json_data = load_json_from_file(json_file_path)
+
 if json_data:
     if not os.path.exists(db_file_path):
         print(f"Error: Database file not found at {db_file_path}")
+        input("Press any key to exit...")
         sys.exit(1)
+
     try:
         sql_statements = json_to_sql_inserts(json_data, db_file_path)
         insert_into_database(sql_statements, db_file_path)
+
     except ValueError as e:
         print(f"Error: {e}")
+        input("Press any key to exit...")
+        sys.exit(1)
+
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        input("Press any key to exit...")
         sys.exit(1)
