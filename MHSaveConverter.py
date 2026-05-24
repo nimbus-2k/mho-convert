@@ -242,6 +242,25 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
 
     if action == "overwrite":
         print(f"Overwriting account '{user_data['Email']}'")
+
+        # Force imported data to reuse the existing account ID
+        old_account_id = user_data["Id"]
+        user_data["Id"] = existing_account_id
+        json_data["Id"] = existing_account_id
+
+        # Remap all entity/container references
+        remap_ids_for_renamed_insert(
+            json_data,
+            existing_account_id,
+            cursor,
+            account_table,
+            guid_tables,
+        )
+
+        # Refresh player data after remap
+        player = json_data.get("Player", {})
+        player["DbGuid"] = existing_account_id
+
         sql_inserts.update(
             build_overwrite_cleanup_statements(
                 cursor,
@@ -255,6 +274,7 @@ def json_to_sql_inserts(json_data, db_path="Account.db"):
                 user_data["Email"],
             )
         )
+
         sql_inserts["Account"].append((
             query,
             tuple(user_data.values())
@@ -383,6 +403,8 @@ if json_data:
     try:
         sql_statements = json_to_sql_inserts(json_data, db_file_path)
         insert_into_database(sql_statements, db_file_path)
+        input("Press any key to exit...")
+        sys.exit(1)
 
     except ValueError as e:
         print(f"Error: {e}")
